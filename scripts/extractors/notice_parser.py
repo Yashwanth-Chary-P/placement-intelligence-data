@@ -1,14 +1,12 @@
 """
 notice_parser.py
-Parses placement notices from TXT files.
+Parses placement notices from TXT files for Phase 1.
 """
 import re
-import uuid
 import datetime
 from pathlib import Path
 import pandas as pd
-from typing import List, Dict, Any, Tuple
-import urllib.parse
+from typing import Dict, Any, Tuple
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -17,15 +15,18 @@ from scripts.utils.logger import get_logger
 
 logger = get_logger("notice_parser")
 
-def _parse_date_string(date_str: str) -> Tuple[str, int, str, int]:
+def _parse_date_string(date_str: str) -> Tuple[str, str, str]:
     """
     Parses complex date strings like '24 & 25.06.2026' or '01 to 08.04.2026'.
-    Returns (iso_date, year, month_name, day) of the first date in the range.
+    Returns (iso_date, year, month_name) of the first date in the range.
     """
+    if not date_str:
+        return "", "", ""
+        
     # Extract the last part which has the month and year
     match = re.search(r'(\d{2})\.(\d{4})', date_str)
     if not match:
-        return "", 0, "", 0
+        return "", "", ""
     
     month = int(match.group(1))
     year = int(match.group(2))
@@ -38,88 +39,111 @@ def _parse_date_string(date_str: str) -> Tuple[str, int, str, int]:
         dt = datetime.date(year, month, day)
         iso_date = dt.isoformat()
         month_name = dt.strftime("%B")
-        return iso_date, year, month_name, day
+        return iso_date, str(year), month_name
     except ValueError:
-        return "", 0, "", 0
+        return "", "", ""
 
 def _generate_pdf_url(title: str) -> str:
-    """Generates the PDF URL based on the title."""
-    # Replace spaces, commas, ampersands, parentheses, hyphens logic
-    # Usually standard is replacing spaces with hyphens, removing special chars
+    """Generates the PDF URL based on the original title."""
     clean_title = re.sub(r'[^\w\s-]', '', title)
     clean_title = re.sub(r'\s+', '-', clean_title)
     url = f"{config.PDF_BASE_URL}{clean_title}.pdf"
     return url
 
-def _detect_stages_and_company(title: str) -> Tuple[str, str]:
+def _generate_match_key(company_name: str) -> str:
+    """Generates a highly normalized match key for future joining."""
+    if not company_name:
+        return ""
+        
+    key = str(company_name).lower()
+    key = key.replace('&', 'and')
+    # Remove all punctuation except alphanumeric and spaces
+    key = re.sub(r'[^a-z0-9\s]', '', key)
+    # Collapse multiple spaces
+    key = re.sub(r'\s+', ' ', key).strip()
+    return key
+
+def _detect_stages_and_company(title: str) -> Tuple[str, bool]:
     """
-    Detects stages from the title based on config.NOTICE_STAGES.
-    Infers company name by removing the stages.
+    Detects the earliest occurrence of any known stage keyword.
+    Returns (company_name, stage_found_boolean).
+    Preserves company qualifiers and internal parentheses.
     """
-    detected_stages = []
-    inferred_title = title
+    lowest_idx = len(title)
+    stage_found = False
     
     for stage in config.NOTICE_STAGES:
-        # Case insensitive match with word boundaries if possible, but stage might be multiple words
-        # Using simple string replace for now since regex with word boundaries might fail on punctuation
-        pattern = re.compile(re.escape(stage), re.IGNORECASE)
-        if pattern.search(inferred_title):
-            detected_stages.append(stage)
-            inferred_title = pattern.sub("", inferred_title)
-            
-    # Clean up company name (remove extra spaces, commas, '&', 'on', etc. at the end)
-    company_name = inferred_title.strip()
+        pattern = re.compile(r'(?i)(?<!\w)' + re.escape(stage) + r'(?!\w)')
+        for m in pattern.finditer(title):
+            if m.start() < lowest_idx:
+                lowest_idx = m.start()
+                stage_found = True
+
+    if lowest_idx == len(title):
+        company_name = title
+    else:
+        company_name = title[:lowest_idx]
+        
+    # Gentle trimming: ONLY remove leading 'the' and trailing 'on', 'and', '&', ',', '-'
+    company_name = company_name.strip()
     company_name = re.sub(r'(?i)^(the\s+)', '', company_name)
-    # Remove trailing words like 'on', 'and', '&', ',', '-'
-    company_name = re.sub(r'(?i)\s+(on|and|&|,|-)\s*$', '', company_name).strip()
+    company_name = re.sub(r'(?i)\s+(on|and)\s*$', '', company_name).strip()
+    company_name = re.sub(r'[\s,&,\-,\–]+$', '', company_name).strip()
     
-    stages_str = ", ".join(detected_stages)
-    return stages_str, company_name
+    return company_name, stage_found
 
 def parse_notice_line(line: str, source: str) -> Dict[str, Any]:
-    """Parses a single notice line."""
+    """Parses a single notice line strictly adhering to Phase 1 rules."""
     line = line.strip()
     if not line:
         return {}
         
-    # Date extraction regex: looks for dates at the end
-    # Matches patterns like 27.07.2026, 24 & 25.06.2026, 01 to 08.04.2026
+    # Date extraction regex anchored to the end of the line
     date_regex = r'(\d{1,2}(?:\s*(?:&|to|-|and)\s*\d{1,2})*\.\d{2}\.\d{4})\.?$'
     date_match = re.search(date_regex, line)
     
     date_str = ""
-    title = line
+    title_without_date = line
+    date_found = False
+    
     if date_match:
         date_str = date_match.group(1)
-        # Remove date and common prefixes like " on " from title
-        title = line[:date_match.start()].strip()
-        title = re.sub(r'(?i)\s+on\s*$', '', title).strip()
+        date_found = True
+        # Strip the date and any trailing " on " from the title
+        title_without_date = line[:date_match.start()].strip()
+        title_without_date = re.sub(r'(?i)\s+on\s*$', '', title_without_date).strip()
         
-    iso_date, year, month, day = _parse_date_string(date_str)
-    notice_type, company_name = _detect_stages_and_company(title)
+    iso_date, year, month = _parse_date_string(date_str)
     
-    # Generate pdf URL based on original line format if title was modified
+    company_name, stage_found = _detect_stages_and_company(title_without_date)
+    company_match_key = _generate_match_key(company_name)
     pdf_url = _generate_pdf_url(line)
     
+    # Confidence Scoring
+    if stage_found and date_found:
+        confidence = "HIGH"
+    elif date_found and not stage_found:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+        
     return {
-        "notice_id": str(uuid.uuid4()),
         "company_name": company_name,
-        "notice_title": line,  # Keep the full original line as title
+        "company_match_key": company_match_key,
         "notice_date": iso_date,
         "year": year,
         "month": month,
-        "day": day,
-        "notice_type": notice_type,
+        "source": source,
         "pdf_url": pdf_url,
-        "source": source
+        "original_title": line,
+        "parsing_confidence": confidence
     }
 
 def process_notices() -> pd.DataFrame:
-    """Processes all TXT notices in current and archive directories."""
-    logger.info("Starting notice extraction...")
+    """Processes all TXT notices strictly for Phase 1 output."""
+    logger.info("Starting production-grade notice extraction...")
     all_records = []
     
-    # Process current notices
     if config.NOTICES_CURRENT_DIR.exists():
         for txt_file in config.NOTICES_CURRENT_DIR.glob("*.txt"):
             with open(txt_file, 'r', encoding='utf-8') as f:
@@ -128,7 +152,6 @@ def process_notices() -> pd.DataFrame:
                     if record:
                         all_records.append(record)
                         
-    # Process archive notices
     if config.NOTICES_ARCHIVE_DIR.exists():
         for txt_file in config.NOTICES_ARCHIVE_DIR.glob("*.txt"):
             with open(txt_file, 'r', encoding='utf-8') as f:
@@ -138,5 +161,5 @@ def process_notices() -> pd.DataFrame:
                         all_records.append(record)
                         
     df = pd.DataFrame(all_records)
-    logger.info(f"Extracted {len(df)} raw notices.")
+    logger.info(f"Successfully processed {len(df)} notices.")
     return df
